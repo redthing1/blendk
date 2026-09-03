@@ -1,0 +1,6 @@
+/.venv/
+/dist/
+/notes
+!AGENTS.md
+__pycache__/
+*.py[cod]
