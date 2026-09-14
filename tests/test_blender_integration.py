@@ -144,6 +144,12 @@ class BlenderIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(scene_preview["engine"], "BLENDER_EEVEE")
 
+        format_settings = "bpy.context.scene.render.image_settings"
+        request(
+            self.project,
+            "run",
+            {"source": f's = {format_settings}\ns.media_type = "VIDEO"\ns.file_format = "FFMPEG"'},
+        )
         render = request(
             self.project,
             "render",
@@ -152,6 +158,12 @@ class BlenderIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(render["engine"], "BLENDER_EEVEE")
         self.assertEqual(self._png_size(Path(render["path"])), (160, 120))
+        restored_format = request(
+            self.project,
+            "eval",
+            {"source": f"[{format_settings}.media_type, {format_settings}.file_format]"},
+        )
+        self.assertEqual(restored_format["value"], ["VIDEO", "FFMPEG"])
 
         existing = self.project / "existing.png"
         existing.write_bytes(b"keep")

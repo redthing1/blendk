@@ -351,6 +351,7 @@ def _visual(params, preview):
         "resolution_x": scene.render.resolution_x,
         "resolution_y": scene.render.resolution_y,
         "resolution_percentage": scene.render.resolution_percentage,
+        "media_type": scene.render.image_settings.media_type,
         "file_format": scene.render.image_settings.file_format,
         "color_mode": scene.render.image_settings.color_mode,
         "color_depth": scene.render.image_settings.color_depth,
@@ -383,6 +384,7 @@ def _visual(params, preview):
                 raise ValueError("size must contain two integers from 1 to 16384")
             scene.render.resolution_x, scene.render.resolution_y = size
         scene.render.resolution_percentage = 100
+        scene.render.image_settings.media_type = "IMAGE"
         scene.render.image_settings.file_format = "PNG"
         scene.render.image_settings.color_mode = "RGBA"
         scene.render.image_settings.color_depth = "8"
@@ -424,6 +426,7 @@ def _visual(params, preview):
         scene.render.resolution_x = original["resolution_x"]
         scene.render.resolution_y = original["resolution_y"]
         scene.render.resolution_percentage = original["resolution_percentage"]
+        scene.render.image_settings.media_type = original["media_type"]
         scene.render.image_settings.file_format = original["file_format"]
         scene.render.image_settings.color_mode = original["color_mode"]
         scene.render.image_settings.color_depth = original["color_depth"]
