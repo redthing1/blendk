@@ -1,9 +1,11 @@
 """Standalone bridge executed by Blender's bundled Python."""
 
+import ast
 import contextlib
 import fnmatch
 import io
 import json
+import linecache
 import os
 import socket
 import struct
@@ -23,6 +25,57 @@ _BUFFER = bytearray()
 _REQUESTS = []
 _MUTATED = False
 _CLOSING = False
+_LOADED_FILE = None
+_LOADED_MTIME_NS = None
+
+
+class _OutputStream(io.StringIO):
+    def __init__(self, request_id, stream):
+        super().__init__()
+        self.request_id = request_id
+        self.stream = stream
+        self.length = 0
+        self.pending = ""
+        self.truncated = False
+
+    def write(self, value):
+        if not isinstance(value, str):
+            raise TypeError("write() argument must be str")
+        remaining = MAX_OUTPUT_CHARS - self.length
+        captured = value[: max(remaining, 0)]
+        if captured:
+            super().write(captured)
+            self.length += len(captured)
+            self.pending += captured
+            self._emit_complete_chunks()
+        if len(value) > len(captured):
+            self.truncated = True
+        return len(value)
+
+    def flush(self):
+        if self.pending:
+            self._emit(self.pending)
+            self.pending = ""
+
+    def _emit_complete_chunks(self):
+        while True:
+            newline = self.pending.find("\n")
+            if newline < 0 and len(self.pending) < 16384:
+                return
+            end = newline + 1 if newline >= 0 else 16384
+            self._emit(self.pending[:end])
+            self.pending = self.pending[end:]
+
+    def _emit(self, text):
+        _send(
+            {
+                "v": PROTOCOL_VERSION,
+                "kind": "event",
+                "id": self.request_id,
+                "stream": self.stream,
+                "text": text,
+            }
+        )
 
 
 def _send(message):
@@ -109,6 +162,7 @@ def _status():
         "engine": scene.render.engine,
         "resolution": [scene.render.resolution_x, scene.render.resolution_y],
         "objects": len(bpy.data.objects),
+        "file_changed_on_disk": _file_changed_on_disk(),
     }
     result.update(_dirty())
     return result
@@ -226,17 +280,29 @@ def _evaluate(params):
     if not isinstance(source, str) or not source.strip():
         raise ValueError("eval requires a nonempty expression")
     namespace = {"bpy": bpy}
-    value = eval(compile(source, "<blendk-eval>", "eval"), namespace, namespace)
+    filename = "<blendk-eval>"
+    _cache_source(filename, source)
+    suite = ast.parse(source, filename=filename, mode="exec")
+    final = suite.body[-1] if suite.body else None
+    if isinstance(final, ast.Expr):
+        prefix = ast.Module(body=suite.body[:-1], type_ignores=[])
+        if prefix.body:
+            exec(compile(prefix, filename, "exec"), namespace, namespace)
+        expression = ast.Expression(body=final.value)
+        value = eval(compile(expression, filename, "eval"), namespace, namespace)
+    else:
+        exec(compile(suite, filename, "exec"), namespace, namespace)
+        value = None
     return {"value": _json_value(value)}
 
 
-def _run(params):
+def _run(params, request_id):
     global _MUTATED
     source = params.get("source")
     if not isinstance(source, str) or not source.strip():
         raise ValueError("run requires a nonempty script")
-    output = io.StringIO()
-    errors = io.StringIO()
+    output = _OutputStream(request_id, "stdout")
+    errors = _OutputStream(request_id, "stderr")
     helper = SimpleNamespace(
         project=Path(os.environ["BLENDK_PROJECT"]),
         artifacts=Path(os.environ["BLENDK_ARTIFACTS"]),
@@ -246,14 +312,25 @@ def _run(params):
         "bpy": bpy,
         "blendk": helper,
     }
-    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
-        exec(compile(source, "<blendk-run>", "exec"), namespace, namespace)
+    filename = "<blendk-run>"
+    _cache_source(filename, source)
+    try:
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            exec(compile(source, filename, "exec"), namespace, namespace)
+    finally:
+        output.flush()
+        errors.flush()
     _MUTATED = True
     return {
-        "stdout": output.getvalue()[:MAX_OUTPUT_CHARS],
-        "stderr": errors.getvalue()[:MAX_OUTPUT_CHARS],
-        "truncated": output.tell() > MAX_OUTPUT_CHARS or errors.tell() > MAX_OUTPUT_CHARS,
+        "stdout": output.getvalue(),
+        "stderr": errors.getvalue(),
+        "truncated": output.truncated or errors.truncated,
     }
+
+
+def _cache_source(filename, source):
+    lines = source.splitlines(True)
+    linecache.cache[filename] = (len(source), None, lines, filename)
 
 
 def _visual(params, preview):
@@ -309,7 +386,10 @@ def _visual(params, preview):
         scene.render.image_settings.file_format = "PNG"
         scene.render.image_settings.color_mode = "RGBA"
         scene.render.image_settings.color_depth = "8"
-        if preview:
+        preview_engine = params.get("engine", "workbench")
+        if preview_engine not in {"workbench", "scene"}:
+            raise ValueError("preview engine must be workbench or scene")
+        if preview and preview_engine == "workbench":
             scene.render.engine = "BLENDER_WORKBENCH"
             scene.render.film_transparent = False
             settings = {
@@ -355,6 +435,7 @@ def _visual(params, preview):
 def _save(params):
     global _MUTATED
     destination = params.get("path")
+    orphans = _zero_user_datablocks()
     if destination is None:
         if not bpy.data.filepath:
             raise ValueError("the scene has no current file; provide a save path")
@@ -364,7 +445,85 @@ def _save(params):
     else:
         raise ValueError("save path must be a string")
     _MUTATED = False
-    return {"path": bpy.data.filepath}
+    _remember_loaded_file()
+    result = {"path": bpy.data.filepath}
+    if orphans:
+        examples = ", ".join(
+            "%s %r" % (item["type"], item["name"]) for item in orphans[:5]
+        )
+        result["warnings"] = [
+            {
+                "code": "zero_user_datablocks",
+                "message": (
+                    "%d zero-user datablock(s) may not survive reopening; link them "
+                    "or enable fake user: %s" % (len(orphans), examples)
+                ),
+                "items": orphans[:50],
+                "truncated": len(orphans) > 50,
+            }
+        ]
+    return result
+
+
+def _zero_user_datablocks():
+    found = []
+    seen = set()
+    for prop in bpy.data.bl_rna.properties:
+        if prop.identifier == "rna_type" or prop.type != "COLLECTION":
+            continue
+        collection = getattr(bpy.data, prop.identifier, None)
+        if collection is None:
+            continue
+        try:
+            items = list(collection)
+        except TypeError:
+            continue
+        for item in items:
+            pointer = item.as_pointer()
+            if pointer in seen or not hasattr(item, "users"):
+                continue
+            seen.add(pointer)
+            if item.users == 0 and not getattr(item, "use_fake_user", False):
+                found.append(
+                    {
+                        "type": item.bl_rna.identifier,
+                        "name": item.name,
+                    }
+                )
+    return sorted(found, key=lambda item: (item["type"], item["name"].casefold()))
+
+
+def _reload(params):
+    global _MUTATED
+    destination = params.get("path") or bpy.data.filepath
+    if not isinstance(destination, str) or not destination:
+        raise ValueError("the scene has no current file; provide a file to reload")
+    path = Path(destination)
+    if not path.is_absolute() or not path.is_file():
+        raise ValueError("reload file does not exist: %s" % destination)
+    bpy.ops.wm.open_mainfile(filepath=str(path))
+    _MUTATED = False
+    _remember_loaded_file()
+    return {"reloaded": True, **_status()}
+
+
+def _remember_loaded_file():
+    global _LOADED_FILE, _LOADED_MTIME_NS
+    _LOADED_FILE = bpy.data.filepath or None
+    try:
+        _LOADED_MTIME_NS = Path(_LOADED_FILE).stat().st_mtime_ns if _LOADED_FILE else None
+    except OSError:
+        _LOADED_MTIME_NS = None
+
+
+def _file_changed_on_disk():
+    current = bpy.data.filepath or None
+    if not current or current != _LOADED_FILE or _LOADED_MTIME_NS is None:
+        return False
+    try:
+        return Path(current).stat().st_mtime_ns != _LOADED_MTIME_NS
+    except OSError:
+        return True
 
 
 def _dispatch(request):
@@ -380,17 +539,33 @@ def _dispatch(request):
     if method == "eval":
         return _evaluate(params)
     if method == "run":
-        return _run(params)
+        return _run(params, request.get("id"))
     if method == "preview":
         return _visual(params, True)
     if method == "render":
         return _visual(params, False)
     if method == "save":
         return _save(params)
+    if method == "reload":
+        return _reload(params)
     if method == "close":
         _CLOSING = True
         return {"closing": True}
     raise ValueError("unknown bridge method: %s" % method)
+
+
+def _error_details(error):
+    extracted = traceback.extract_tb(error.__traceback__)
+    user_frames = [frame for frame in extracted if frame.filename.startswith("<blendk-")]
+    if user_frames:
+        return (
+            "Traceback (most recent call last):\n"
+            + "".join(traceback.format_list(user_frames))
+            + "".join(traceback.format_exception_only(error))
+        )[-16000:]
+    if isinstance(error, SyntaxError) and str(error.filename).startswith("<blendk-"):
+        return "".join(traceback.format_exception_only(error))[-16000:]
+    return traceback.format_exc(limit=20)[-16000:]
 
 
 def _handle(request):
@@ -413,7 +588,7 @@ def _handle(request):
             "error": {
                 "code": "blender_error",
                 "message": str(error) or error.__class__.__name__,
-                "details": traceback.format_exc(limit=20)[-16000:],
+                "details": _error_details(error),
             },
         }
     _send(response)
@@ -449,8 +624,9 @@ def _headed_tick():
 
 _SOCKET = socket.create_connection(
     (os.environ["BLENDK_BRIDGE_HOST"], int(os.environ["BLENDK_BRIDGE_PORT"])),
-    timeout=15,
+    timeout=float(os.environ.get("BLENDK_BRIDGE_CONNECT_TIMEOUT", "15")),
 )
+_remember_loaded_file()
 _send(
     {
         "v": PROTOCOL_VERSION,
@@ -465,6 +641,7 @@ if hello.get("ok") is not True:
     raise RuntimeError("blendk supervisor rejected the bridge")
 
 if os.environ["BLENDK_MODE"] == "headless":
+    _SOCKET.settimeout(None)
     _headless()
 else:
     _SOCKET.setblocking(False)

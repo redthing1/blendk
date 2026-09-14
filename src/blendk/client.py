@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 import socket
+from collections.abc import Callable
 from pathlib import Path
 
 from blendk.errors import BlendkError
@@ -15,8 +16,10 @@ def request(
     params: dict[str, object] | None = None,
     *,
     timeout: float | None = None,
+    on_event: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
-    descriptor = read_descriptor(paths_for(project))
+    paths = paths_for(project)
+    descriptor = read_descriptor(paths)
     host = _string(descriptor, "host")
     port = _integer(descriptor, "port")
     token = _string(descriptor, "token")
@@ -51,6 +54,8 @@ def request(
             while True:
                 response = receive_frame(connection)
                 if response.get("kind") == "event":
+                    if on_event is not None:
+                        on_event(response)
                     continue
                 if response.get("id") != request_id:
                     raise BlendkError("protocol_error", "received a response for another request")
@@ -59,7 +64,10 @@ def request(
                 result = response.get("result")
                 return result if isinstance(result, dict) else {"value": result}
     except OSError as error:
-        raise BlendkError("not_running", "cannot reach the blendk supervisor") from error
+        message = f"cannot reach the blendk supervisor for project {paths.project}"
+        if paths.log.is_file():
+            message += f"; log: {paths.log}"
+        raise BlendkError("not_running", message) from error
 
 
 def _raise_remote(message: dict[str, object]) -> None:
@@ -68,7 +76,12 @@ def _raise_remote(message: dict[str, object]) -> None:
         code = error.get("code")
         text = error.get("message")
         if isinstance(code, str) and isinstance(text, str):
-            raise BlendkError(code, text)
+            details = error.get("details")
+            raise BlendkError(
+                code,
+                text,
+                details=details if isinstance(details, str) else None,
+            )
     raise BlendkError("remote_error", "blendk request failed")
 
 

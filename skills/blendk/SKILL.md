@@ -48,8 +48,12 @@ blendk preview
 blendk render
 ```
 
+`open` reuses the live scene; `open --fresh [scene.blend]` explicitly discards it and
+reloads from disk. Use `blendk logs` to diagnose an ended session.
+
 After the first checkpoint, bare `blendk save` updates the current file. Use `eval` for
-focused observations such as `blendk eval 'bpy.context.scene.render.engine'`.
+focused observations such as `blendk eval 'bpy.context.scene.render.engine'`. Save
+reports zero-user datablocks that may not survive reopening.
 
 Preview and render return absolute PNG paths. Inspect the image, adjust from visible
 evidence, and repeat at the fidelity appropriate to the current question.

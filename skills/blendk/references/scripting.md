@@ -11,8 +11,9 @@ Each call receives a fresh namespace:
 - `blendk.project`: canonical project directory;
 - `blendk.artifacts`: managed artifact directory.
 
-Store lasting state in Blender data or project files. Standard output and errors return
-to the client with bounded size.
+Store lasting state in Blender data or project files. Standard output and errors stream
+to the invoking client and remain bounded; text output says explicitly when that bound
+truncates a result.
 
 ## Scene changes
 
@@ -33,8 +34,8 @@ cube.scale = (1.0, 2.0, 1.0)
 ```
 
 Group related edits into a coherent step, inspect the result, and checkpoint valuable
-progress. Long scripts occupy Blender's main thread, so several observable stages are
-usually easier to evaluate than one large execution.
+progress. Long scripts occupy Blender's main thread, so print and flush meaningful
+milestones when live progress helps the operator understand the current stage.
 
 ## Observation
 
@@ -45,11 +46,21 @@ blendk eval 'bpy.context.scene.render.engine'
 blendk eval 'sorted(object.name for object in bpy.data.objects)'
 ```
 
+For a multi-line observation, use stdin. Setup statements run in a fresh namespace and
+the final expression becomes the result:
+
+```sh
+blendk eval - <<'PY'
+names = sorted(object.name for object in bpy.data.objects)
+names[:10]
+PY
+```
+
 Expressions have the same Python authority as scripts. Keeping mutations in `run`
 preserves meaningful dirty tracking.
 
 ## Errors
 
-Python exceptions return a bounded traceback. Changes made before an exception remain
-in the scene. Inspect the current state, compare it with the last checkpoint, and
-continue from evidence.
+Python exceptions return a bounded traceback with script line context. Changes made
+before an exception remain in the scene. Inspect the current state, compare it with the
+last checkpoint, and continue from evidence.

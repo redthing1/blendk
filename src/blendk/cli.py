@@ -16,7 +16,13 @@ from blendk.blender import discover, probe
 from blendk.client import request
 from blendk.errors import BlendkError
 from blendk.process import is_running, popen_options
-from blendk.session import SessionPaths, canonical_project, lock_owner, paths_for, prepare
+from blendk.session import (
+    SessionPaths,
+    canonical_project,
+    lock_owner,
+    paths_for,
+    prepare,
+)
 from blendk.supervisor import Supervisor, SupervisorOptions
 
 
@@ -138,6 +144,10 @@ def open_session(
         bool,
         typer.Option("--autoexec", help="Permit scripts embedded in .blend files."),
     ] = False,
+    fresh: Annotated[
+        bool,
+        typer.Option("--fresh", help="Reload from disk, explicitly discarding live changes."),
+    ] = False,
 ) -> None:
     """Start or reuse the project's Blender session."""
     state = _context(context)
@@ -152,7 +162,7 @@ def open_session(
         if error.code != "not_running":
             _fail(error, json_output=state.json)
     else:
-        if selected is not None and existing.get("file") != str(selected):
+        if selected is not None and existing.get("file") != str(selected) and not fresh:
             _fail(
                 BlendkError(
                     "different_file",
@@ -160,6 +170,18 @@ def open_session(
                 ),
                 json_output=state.json,
             )
+        if fresh:
+            _remote(
+                context,
+                "reload",
+                {"path": str(selected) if selected is not None else None},
+                timeout=None,
+            )
+            return
+        existing["reused"] = True
+        if existing.get("dirty") is True or existing.get("file_changed_on_disk") is True:
+            message = "reused the live scene; use open --fresh to discard it and reload disk"
+            existing["warnings"] = [{"message": message}]
         _print(state, existing)
         return
 
@@ -190,15 +212,14 @@ def open_session(
     if autoexec:
         command.append("--autoexec")
 
-    with paths.log.open("w", encoding="utf-8") as log:
-        supervisor = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            close_fds=True,
-            **popen_options(detached=True),
-        )
+    supervisor = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        **popen_options(detached=True),
+    )
     _await_session(state, paths, supervisor)
 
 
@@ -290,11 +311,17 @@ def preview(
         str,
         typer.Option("--size", help="Image size as WIDTHxHEIGHT."),
     ] = "512x512",
+    engine: Annotated[
+        str,
+        typer.Option("--engine", help="Preview engine: workbench or scene."),
+    ] = "workbench",
 ) -> None:
-    """Create a fast Workbench camera render."""
+    """Create a quick camera render with Workbench or the scene engine."""
     state = _context(context)
     try:
         dimensions = _parse_size(size)
+        if engine not in {"workbench", "scene"}:
+            raise BlendkError("invalid_engine", "preview engine must be workbench or scene")
     except BlendkError as error:
         _fail(error, json_output=state.json)
     _remote(
@@ -305,6 +332,7 @@ def preview(
             "camera": camera,
             "frame": frame,
             "size": dimensions,
+            "engine": engine,
         },
         timeout=None,
     )
@@ -380,6 +408,36 @@ def close(
     _remote(context, "close", {"discard": discard, "kill": kill})
 
 
+@app.command()
+def logs(
+    context: typer.Context,
+    lines: Annotated[
+        int,
+        typer.Option("--lines", min=1, max=2000, help="Number of recent lines."),
+    ] = 100,
+) -> None:
+    """Show recent supervisor and Blender diagnostics."""
+    state = _context(context)
+    path = paths_for(state.project).log
+    try:
+        recent = path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+    except OSError:
+        _fail(
+            BlendkError("logs_unavailable", f"no session log is available: {path}"),
+            json_output=state.json,
+        )
+    if state.json:
+        typer.echo(
+            json.dumps(
+                {"path": str(path), "lines": recent},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    elif recent:
+        typer.echo("\n".join(recent))
+
+
 def _remote(
     context: typer.Context,
     method: str,
@@ -387,7 +445,34 @@ def _remote(
     *,
     timeout: float | None = 30,
 ) -> None:
-    _execute(context, lambda state: request(state.project, method, params, timeout=timeout))
+    def operation(state: Context) -> dict[str, object]:
+        streamed = False
+
+        def on_event(event: dict[str, object]) -> None:
+            nonlocal streamed
+            stream = event.get("stream")
+            payload = event.get("text")
+            if not isinstance(payload, str) or stream not in {"stdout", "stderr"}:
+                return
+            streamed = True
+            typer.echo(
+                payload,
+                err=stream == "stderr",
+                nl=False,
+            )
+
+        result = request(
+            state.project,
+            method,
+            params,
+            timeout=timeout,
+            on_event=None if state.json else on_event,
+        )
+        if streamed and "stdout" in result:
+            result = {**result, "stdout": "", "stderr": "", "streamed": True}
+        return result
+
+    _execute(context, operation)
 
 
 def _execute(
@@ -405,6 +490,12 @@ def _print(state: Context, result: dict[str, object]) -> None:
     if state.json:
         typer.echo(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         return
+    warnings = result.get("warnings")
+    if isinstance(warnings, list):
+        for warning in warnings:
+            if isinstance(warning, dict) and isinstance(warning.get("message"), str):
+                typer.echo(f"warning: {warning['message']}", err=True)
+        result = {key: value for key, value in result.items() if key != "warnings"}
     if "stdout" in result:
         stdout = result.get("stdout")
         stderr = result.get("stderr")
@@ -412,7 +503,9 @@ def _print(state: Context, result: dict[str, object]) -> None:
             typer.echo(stdout, nl=not stdout.endswith("\n"))
         if isinstance(stderr, str) and stderr:
             typer.echo(stderr, err=True, nl=not stderr.endswith("\n"))
-        if not stdout and not stderr:
+        if result.get("truncated") is True:
+            typer.echo("blendk: script output was truncated", err=True)
+        if not stdout and not stderr and result.get("streamed") is not True:
             typer.echo("ok")
         return
     if set(result) == {"value"}:
@@ -466,9 +559,12 @@ def _parse_size(value: str) -> list[int]:
 
 def _fail(error: BlendkError, *, json_output: bool = False) -> Never:
     if json_output:
+        payload = {"code": error.code, "message": error.message}
+        if error.details:
+            payload["details"] = error.details
         typer.echo(
             json.dumps(
-                {"ok": False, "error": {"code": error.code, "message": error.message}},
+                {"ok": False, "error": payload},
                 ensure_ascii=False,
                 separators=(",", ":"),
             ),
@@ -476,6 +572,8 @@ def _fail(error: BlendkError, *, json_output: bool = False) -> Never:
         )
     else:
         typer.echo(f"{error.code}: {error.message}", err=True)
+        if error.details:
+            typer.echo(error.details.rstrip(), err=True)
     raise typer.Exit(1)
 
 

@@ -59,10 +59,9 @@ blendk serve --headed [scene.blend]
 ```
 
 Add `--profile native` when the session needs operator-installed settings, add-ons,
-renderers, or devices.
-Use `blendk open --headed` when a visible window should outlive the starting terminal.
-Commands identify a session by the current directory. Add `--project <dir>` before a
-command when invoking it elsewhere.
+renderers, or devices. `open --headed` starts a detached visible window. Sessions are
+identified by the current directory; use `--project <dir>` from elsewhere. `open`
+reuses the live scene; `open --fresh` reloads from disk. Use `blendk logs` after an exit.
 
 ## Verify
 

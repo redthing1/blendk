@@ -4,6 +4,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from blendk.cli import Context, _print
 
 
 class CliTests(unittest.TestCase):
@@ -24,6 +27,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "")
         error = json.loads(completed.stderr)
         self.assertEqual(error["error"]["code"], "invalid_size")
+
+    def test_text_run_output_marks_truncation(self) -> None:
+        with patch("blendk.cli.typer.echo") as echo:
+            _print(
+                Context(project=Path.cwd(), json=False),
+                {"stdout": "partial", "stderr": "", "truncated": True},
+            )
+
+        self.assertTrue(
+            any(
+                call.args == ("blendk: script output was truncated",)
+                and call.kwargs.get("err") is True
+                for call in echo.call_args_list
+            )
+        )
+
+    def test_text_warnings_use_stderr(self) -> None:
+        with patch("blendk.cli.typer.echo") as echo:
+            _print(
+                Context(project=Path.cwd(), json=False),
+                {"path": "/scene.blend", "warnings": [{"message": "check datablock"}]},
+            )
+
+        echo.assert_any_call("warning: check datablock", err=True)
 
     @staticmethod
     def _run(*arguments: str) -> subprocess.CompletedProcess[str]:

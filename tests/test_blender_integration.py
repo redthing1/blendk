@@ -49,7 +49,43 @@ class BlenderIntegrationTests(unittest.TestCase):
         self.assertEqual(status["state"], "ready")
         evaluated = request(self.project, "eval", {"source": "len(bpy.data.objects)"})
         self.assertEqual(evaluated["value"], 3)
+        multiline = request(
+            self.project,
+            "eval",
+            {"source": "names = sorted(obj.name for obj in bpy.data.objects)\nnames"},
+        )
+        self.assertEqual(multiline["value"], ["Camera", "Cube", "Light"])
         self._assert_wrong_token_rejected()
+
+        events: list[dict[str, object]] = []
+        streamed = request(
+            self.project,
+            "run",
+            {"source": 'print("first", flush=True)\nprint("second")'},
+            on_event=events.append,
+        )
+        self.assertEqual(streamed["stdout"], "first\nsecond\n")
+        self.assertEqual(
+            "".join(str(event.get("text", "")) for event in events),
+            "first\nsecond\n",
+        )
+
+        with self.assertRaises(BlendkError) as raised:
+            request(
+                self.project,
+                "run",
+                {"source": "value = 1\nraise RuntimeError('broken')"},
+            )
+        self.assertIn("line 2", raised.exception.details or "")
+        self.assertIn("raise RuntimeError('broken')", raised.exception.details or "")
+
+        oversized = request(
+            self.project,
+            "run",
+            {"source": "print('x' * (256 * 1024 + 1))"},
+        )
+        self.assertTrue(oversized["truncated"])
+        self.assertEqual(len(oversized["stdout"]), 256 * 1024)
 
         self._disconnect_during_run()
         deadline = time.monotonic() + 5
@@ -94,6 +130,20 @@ class BlenderIntegrationTests(unittest.TestCase):
         self.assertEqual(restored["engine"], "BLENDER_EEVEE")
         self.assertEqual(restored["resolution"], [1920, 1080])
 
+        scene_preview = request(
+            self.project,
+            "preview",
+            {
+                "path": None,
+                "camera": None,
+                "frame": None,
+                "size": [160, 120],
+                "engine": "scene",
+            },
+            timeout=None,
+        )
+        self.assertEqual(scene_preview["engine"], "BLENDER_EEVEE")
+
         render = request(
             self.project,
             "render",
@@ -116,9 +166,43 @@ class BlenderIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(BlendkError, "unsaved changes"):
             request(self.project, "close")
         save_path = self.project / "scene.blend"
+        request(
+            self.project,
+            "run",
+            {"source": 'bpy.data.worlds.new("Unlinked Sunset")'},
+        )
         saved = request(self.project, "save", {"path": str(save_path)}, timeout=None)
         self.assertEqual(Path(saved["path"]), save_path)
         self.assertTrue(save_path.is_file())
+        warnings = saved.get("warnings", [])
+        self.assertTrue(
+            any(
+                item.get("name") == "Unlinked Sunset"
+                for warning in warnings
+                for item in warning.get("items", [])
+            )
+        )
+
+        request(
+            self.project,
+            "run",
+            {"source": 'bpy.data.objects["Cube"].location.x = 99'},
+        )
+        current_mtime = save_path.stat().st_mtime_ns
+        os.utime(save_path, ns=(current_mtime + 1_000_000_000,) * 2)
+        self.assertTrue(request(self.project, "status")["file_changed_on_disk"])
+        reloaded = request(self.project, "reload", {"path": str(save_path)}, timeout=None)
+        self.assertTrue(reloaded["reloaded"])
+        self.assertFalse(reloaded["dirty"])
+        self.assertFalse(reloaded["file_changed_on_disk"])
+        self.assertEqual(
+            request(
+                self.project,
+                "eval",
+                {"source": 'bpy.data.objects["Cube"].location.x'},
+            )["value"],
+            2.0,
+        )
         request(self.project, "close")
         self.supervisor.wait(timeout=10)
 
@@ -146,6 +230,16 @@ class BlenderIntegrationTests(unittest.TestCase):
         while time.monotonic() < deadline and paths_for(self.project).descriptor.exists():
             time.sleep(0.05)
         self.assertFalse(paths_for(self.project).descriptor.exists())
+        self.assertIn("session ended: closed cleanly", paths_for(self.project).log.read_text())
+
+    def test_headless_survives_bridge_connect_timeout(self) -> None:
+        self._start(headed=False, bridge_connect_timeout=0.1)
+
+        time.sleep(0.25)
+
+        status = request(self.project, "status")
+        self.assertEqual(status["state"], "ready")
+        self.assertIsNone(status["exit_code"])
 
     def test_simultaneous_open_reuses_one_supervisor(self) -> None:
         command = [
@@ -201,7 +295,12 @@ class BlenderIntegrationTests(unittest.TestCase):
         request(self.project, "close")
         self.supervisor.wait(timeout=10)
 
-    def _start(self, *, headed: bool) -> None:
+    def _start(
+        self,
+        *,
+        headed: bool,
+        bridge_connect_timeout: float | None = None,
+    ) -> None:
         command = [
             sys.executable,
             "-m",
@@ -214,8 +313,12 @@ class BlenderIntegrationTests(unittest.TestCase):
         ]
         if headed:
             command.append("--headed")
+        environment = os.environ.copy()
+        if bridge_connect_timeout is not None:
+            environment["BLENDK_BRIDGE_CONNECT_TIMEOUT"] = str(bridge_connect_timeout)
         self.supervisor = subprocess.Popen(
             command,
+            env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

@@ -58,13 +58,40 @@ def prepare(paths: SessionPaths) -> None:
         paths.artifacts.chmod(0o700)
 
 
+def trim_log(paths: SessionPaths, *, keep_bytes: int = 1024 * 1024) -> None:
+    """Retain a bounded tail before a new supervisor appends another session."""
+    try:
+        size = paths.log.stat().st_size
+    except OSError:
+        return
+    if size <= keep_bytes:
+        return
+    with paths.log.open("rb") as source:
+        source.seek(-keep_bytes, os.SEEK_END)
+        tail = source.read()
+    handle, temporary = tempfile.mkstemp(prefix="log-", suffix=".tmp", dir=paths.root)
+    temporary_path = Path(temporary)
+    try:
+        if os.name != "nt":
+            os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(tail)
+        temporary_path.replace(paths.log)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def read_descriptor(paths: SessionPaths) -> dict[str, object]:
     try:
         if os.name != "nt" and stat.S_IMODE(paths.descriptor.stat().st_mode) & 0o077:
             raise BlendkError("unsafe_session", "session descriptor permissions are too broad")
         value = json.loads(paths.descriptor.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
-        raise BlendkError("not_running", "no blendk session is running for this project") from error
+        message = f"no blendk session is running for project {paths.project}"
+        if paths.log.is_file():
+            message += f"; log: {paths.log}"
+        raise BlendkError("not_running", message) from error
     except json.JSONDecodeError as error:
         raise BlendkError("invalid_session", "session descriptor is invalid") from error
     if not isinstance(value, dict):

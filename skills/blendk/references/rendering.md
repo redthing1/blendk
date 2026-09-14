@@ -14,6 +14,9 @@ blendk preview --size 800x450
 blendk preview --camera Camera_Close --frame 24
 ```
 
+Use `--engine scene` for a quick material-and-lighting check through the scene's active
+engine while retaining preview's modest default size.
+
 ## Render
 
 `blendk render` uses the scene's active registered engine and its existing materials,

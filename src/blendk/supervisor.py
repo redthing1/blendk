@@ -23,6 +23,7 @@ from blendk.session import (
     acquire_lock,
     paths_for,
     release_lock,
+    trim_log,
     write_descriptor,
 )
 
@@ -56,12 +57,19 @@ class Supervisor:
         self.active_since: float | None = None
         self.process: subprocess.Popen[str] | None = None
         self.exit_code: int | None = None
-        self.logs: collections.deque[str] = collections.deque(maxlen=200)
+        self.log_lock = threading.Lock()
+        self.log_stream = None
         self.outcomes: collections.OrderedDict[str, dict[str, object]] = collections.OrderedDict()
+        self.shutdown_reason = "supervisor stopped without a recorded reason"
 
     def run(self) -> None:
         lock_descriptor = acquire_lock(self.paths)
         try:
+            trim_log(self.paths)
+            self.log_stream = self.paths.log.open("a", encoding="utf-8")
+            self._log(
+                f"session starting: project={self.paths.project} supervisor_pid={os.getpid()}"
+            )
             self.listener.bind(("127.0.0.1", 0))
             self.listener.listen()
             self.listener.settimeout(0.5)
@@ -104,6 +112,9 @@ class Supervisor:
                 except KeyboardInterrupt:
                     if not self.foreground or self._foreground_interrupt():
                         break
+        except BaseException as error:
+            self.shutdown_reason = f"supervisor failed: {error.__class__.__name__}: {error}"
+            raise
         finally:
             self.stop.set()
             self.listener.close()
@@ -111,8 +122,17 @@ class Supervisor:
                 self.bridge.close()
             if self.process is not None and self.process.poll() is None and not self.options.headed:
                 terminate(self.process, force=True)
-            self.paths.descriptor.unlink(missing_ok=True)
-            release_lock(self.paths, lock_descriptor)
+            self._log(f"session ended: {self.shutdown_reason}")
+            try:
+                self.paths.descriptor.unlink(missing_ok=True)
+            finally:
+                try:
+                    release_lock(self.paths, lock_descriptor)
+                finally:
+                    with self.log_lock:
+                        if self.log_stream is not None:
+                            self.log_stream.close()
+                            self.log_stream = None
 
     def _foreground_interrupt(self) -> bool:
         if not self.operation.acquire(blocking=False):
@@ -142,6 +162,7 @@ class Supervisor:
                     "params": {},
                 }
             )
+            self.shutdown_reason = "closed from the foreground"
             self.stop.set()
             return True
         except BlendkError as error:
@@ -234,6 +255,7 @@ class Supervisor:
         if method == "close" and params.get("kill") is True:
             if self.process is not None:
                 terminate(self.process, force=True)
+            self.shutdown_reason = "forcibly closed by client"
             result = {"closing": True, "forced": True}
             self._remember(request_id, self._response(request_id, result))
             self._send_result(connection, request_id, result)
@@ -254,6 +276,8 @@ class Supervisor:
                 result = self._visual_request(request)
             elif method == "save":
                 result = self._save_request(request)
+            elif method == "run":
+                result = self._call_bridge(request, event_connection=connection)
             else:
                 result = self._call_bridge(request)
             self._remember(request_id, result)
@@ -287,7 +311,14 @@ class Supervisor:
                     str(request["id"]),
                     BlendkError("dirty", f"scene has unsaved changes: {reasons}"),
                 )
-        return self._call_bridge(request)
+        response = self._call_bridge(request)
+        if response.get("ok") is True:
+            self.shutdown_reason = (
+                "closed by client with unsaved changes discarded"
+                if params.get("discard") is True
+                else "closed cleanly by client"
+            )
+        return response
 
     def _visual_request(self, request: dict[str, object]) -> dict[str, object]:
         params = request["params"]
@@ -343,7 +374,12 @@ class Supervisor:
             raise BlendkError("destination_exists", f"destination already exists: {path}")
         return self._call_bridge(request)
 
-    def _call_bridge(self, request: dict[str, object]) -> dict[str, object]:
+    def _call_bridge(
+        self,
+        request: dict[str, object],
+        *,
+        event_connection: socket.socket | None = None,
+    ) -> dict[str, object]:
         if not self.bridge_ready.wait(timeout=15):
             raise BlendkError("blender_unavailable", "Blender bridge is not ready")
         bridge = self.bridge
@@ -354,7 +390,11 @@ class Supervisor:
             while True:
                 response = receive_frame(bridge)
                 if response.get("kind") == "event":
-                    self._log(str(response.get("message", "")))
+                    if event_connection is not None:
+                        try:
+                            send_frame(event_connection, response)
+                        except OSError:
+                            pass
                     continue
                 if response.get("id") != request.get("id"):
                     raise BlendkError(
@@ -403,13 +443,26 @@ class Supervisor:
             return
         self.exit_code = process.wait()
         self._log(f"Blender exited with code {self.exit_code}")
+        if not self.stop.is_set():
+            self.shutdown_reason = f"Blender exited with code {self.exit_code}"
         self.stop.set()
 
     def _log(self, message: str) -> None:
         if not message:
             return
-        self.logs.append(message[:4000])
-        print(message, flush=True)
+        message = message[:4000]
+        with self.log_lock:
+            if self.log_stream is not None:
+                try:
+                    self.log_stream.write(message + "\n")
+                    self.log_stream.flush()
+                except OSError:
+                    pass
+        if self.foreground:
+            try:
+                print(message, flush=True)
+            except BrokenPipeError:
+                pass
 
     def _remember(self, request_id: str, response: dict[str, object]) -> None:
         self.outcomes[request_id] = response
@@ -437,12 +490,15 @@ class Supervisor:
 
     @staticmethod
     def _error_response(request_id: str | None, error: BlendkError) -> dict[str, object]:
+        payload: dict[str, object] = {"code": error.code, "message": error.message}
+        if error.details:
+            payload["details"] = error.details
         return {
             "v": PROTOCOL_VERSION,
             "kind": "response",
             "id": request_id,
             "ok": False,
-            "error": {"code": error.code, "message": error.message},
+            "error": payload,
         }
 
     def _send_error(
