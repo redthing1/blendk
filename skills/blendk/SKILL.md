@@ -70,8 +70,8 @@ blendk close
 
 ## References
 
-- Read [scripting.md](references/scripting.md) when authoring `bpy` changes or handling
-  execution failures.
+- Read [scripting.md](references/scripting.md) when authoring or investigating `bpy`
+  behavior.
 - Read [rendering.md](references/rendering.md) when choosing previews, render engines,
   cameras, image sizes, or devices.
 - Read [security.md](references/security.md) for profiles, trusted-code boundaries,

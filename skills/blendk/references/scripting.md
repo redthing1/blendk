@@ -59,6 +59,17 @@ PY
 Expressions have the same Python authority as scripts. Keeping mutations in `run`
 preserves meaningful dirty tracking.
 
+## API discovery
+
+Blender evolves, and remembered examples may describe an older release. The live
+runtime supports discovery through Python introspection and RNA metadata.
+
+When an API is unfamiliar, `eval` and `run` can examine the relevant live objects and
+scene state: types and current values, available attributes, docstrings where present,
+and RNA properties. A small probe can also reveal behavior that static metadata does
+not. Official documentation matching `bpy.app.version` can provide another source of
+evidence when available. Carry only the relevant findings into the working script.
+
 ## Errors
 
 Python exceptions return a bounded traceback with script line context. Changes made
